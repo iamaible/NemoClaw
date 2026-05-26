@@ -2891,13 +2891,39 @@ jobs:
             await core.summary.write();
             core.setOutput('scorecard', scorecard);
 
+            // Expose structured data for the Slack step so it can build a rich
+            // Block Kit payload without re-parsing the rendered Markdown.
+            // Contract is documented in scripts/scorecard/build-slack-blocks.js.
+            core.setOutput('scorecardData', JSON.stringify({
+              today,
+              runMode,
+              isSelectiveDispatch,
+              requestedJobs,
+              total,
+              ran,
+              success,
+              failure,
+              cancelled,
+              skipped,
+              perfect,
+              failedJobs,
+              trendLine,
+              runUrl,
+            }));
+
       # ── Optional Slack notification ────────────────────────────
       - name: Post scorecard to Slack
-        if: ${{ steps.scorecard.outputs.scorecard != '' }}
+        if: ${{ steps.scorecard.outputs.scorecardData != '' }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          SCORECARD_TEXT: ${{ steps.scorecard.outputs.scorecard }}
+          # SWAP POINT: change ONLY the secret reference on the right when
+          # promoting from preview to production. The left-side name
+          # SLACK_WEBHOOK_URL is the stable in-process contract the script
+          # reads via process.env.SLACK_WEBHOOK_URL — do not rename it.
+          #   Preview / testing:  secrets.SLACK_WEBHOOK_URL_PREVIEW
+          #   Production:         secrets.SLACK_WEBHOOK_URL
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL_PREVIEW }}
+          SCORECARD_DATA: ${{ steps.scorecard.outputs.scorecardData }}
         with:
           script: |
             const webhookUrl = process.env.SLACK_WEBHOOK_URL;
@@ -2906,18 +2932,21 @@ jobs:
               return;
             }
 
-            const scorecard = process.env.SCORECARD_TEXT;
+            const path = require('path');
+            const { buildBlocks, buildFallbackText } = require(
+              path.join(process.env.GITHUB_WORKSPACE, 'scripts/scorecard/build-slack-blocks.js'),
+            );
 
-            // Strip markdown formatting for Slack plain-text rendering
-            const slackText = scorecard
-              .replace(/^## /gm, '')
-              .replace(/\*\*/g, '*')
-              .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<$2|$1>');
+            const data = JSON.parse(process.env.SCORECARD_DATA);
+            const payload = {
+              text: buildFallbackText(data),
+              blocks: buildBlocks(data),
+            };
 
             const resp = await fetch(webhookUrl, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ text: slackText }),
+              body: JSON.stringify(payload),
             });
 
             if (!resp.ok) {
