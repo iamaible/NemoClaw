@@ -103,6 +103,13 @@ const ANSI_RE = /\x1B(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\)|[@-_])/g;
 const runner: typeof import("./runner") = require("./runner");
 const { ROOT, SCRIPTS, redact, run, runShell, runCapture, runFile, shellQuote, validateName } =
   runner;
+const BRAVE_PROVIDER_PROFILE_ID = "brave";
+const BRAVE_PROVIDER_PROFILE_PATH = path.join(
+  ROOT,
+  "nemoclaw-blueprint",
+  "provider-profiles",
+  "brave.yaml",
+);
 const nameValidation: typeof import("./name-validation") = require("./name-validation");
 const { NAME_ALLOWED_FORMAT, getNameValidationGuidance } = nameValidation;
 const docker: typeof import("./adapters/docker") = require("./adapters/docker");
@@ -1790,7 +1797,12 @@ function upsertProvider(
   return result;
 }
 
-type MessagingTokenDef = { name: string; envKey: string; token: string | null };
+type MessagingTokenDef = {
+  name: string;
+  envKey: string;
+  token: string | null;
+  providerType?: string;
+};
 
 type EndpointValidationResult =
   | { ok: true; api: string | null; retry?: undefined }
@@ -1821,8 +1833,43 @@ function verifyDirectSandboxGpu(sandboxName: string): void {
   }
 }
 
-function upsertMessagingProviders(tokenDefs: MessagingTokenDef[]) {
-  const upserted = onboardProviders.upsertMessagingProviders(tokenDefs, runOpenshell);
+function ensureBraveProviderProfile(tokenDefs: MessagingTokenDef[]): void {
+  if (
+    !tokenDefs.some(
+      ({ providerType, token }) => providerType === BRAVE_PROVIDER_PROFILE_ID && Boolean(token),
+    )
+  ) {
+    return;
+  }
+
+  const result = runOpenshell(["provider", "profile", "import", "--file", BRAVE_PROVIDER_PROFILE_PATH], {
+    ignoreError: true,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (result.status === 0) return;
+
+  // Tolerate "already exists" diagnostics so re-onboard/recreate with a Brave
+  // profile already registered on the gateway keeps working.
+  const rawDiagnostic = `${result.stderr || ""} ${result.stdout || ""}`;
+  if (/already exists/i.test(rawDiagnostic)) return;
+
+  const diagnostic = compactText(redact(rawDiagnostic));
+  console.error("\n  ✗ Failed to register the Brave Search provider profile with OpenShell.");
+  if (diagnostic) console.error(`    ${diagnostic.slice(0, 500)}`);
+  console.error("    Update OpenShell with scripts/install-openshell.sh and re-run onboarding.");
+  process.exit(result.status || 1);
+}
+
+function upsertMessagingProviders(
+  tokenDefs: MessagingTokenDef[],
+  options: { replaceExisting?: boolean } = {},
+) {
+  ensureBraveProviderProfile(tokenDefs);
+  const upserted = onboardProviders.upsertMessagingProviders(
+    tokenDefs,
+    runOpenshell,
+    options,
+  );
   // upsertMessagingProviders process.exits on failure, so reaching this
   // point means every entry in tokenDefs that had a token was registered.
   // Mark migrated only when the registered token equals the staged legacy
@@ -4798,7 +4845,7 @@ async function createSandbox(
     ),
   );
 
-  const messagingTokenDefs = [
+  const messagingTokenDefs: MessagingTokenDef[] = [
     {
       name: `${sandboxName}-discord-bridge`,
       envKey: "DISCORD_BOT_TOKEN",
@@ -4829,10 +4876,16 @@ async function createSandbox(
     .filter(({ envKey }) => !disabledEnvKeys.has(envKey));
 
   if (webSearchConfig) {
+    // Tag the provider type as "brave" so the L7 proxy rewrites
+    // X-Subscription-Token via the registered Brave provider profile.
+    // No `replaceExistingProvider` — OpenShell rejects `provider delete` on
+    // providers still attached to a live sandbox, so reuse paths must rely
+    // on `provider update` to refresh the credential in place.
     messagingTokenDefs.push({
       name: `${sandboxName}-brave-search`,
       envKey: webSearch.BRAVE_API_KEY_ENV,
       token: getCredential(webSearch.BRAVE_API_KEY_ENV),
+      providerType: BRAVE_PROVIDER_PROFILE_ID,
     });
   }
   const previousProviderCredentialHashes =
@@ -5330,12 +5383,21 @@ async function createSandbox(
     }),
   ];
 
-  // Create OpenShell providers for messaging credentials so they flow through
-  // the provider/placeholder system instead of raw env vars. The L7 proxy
-  // rewrites Authorization headers (Bearer/Bot) and URL-path segments
-  // (/bot{TOKEN}/) with real secrets at egress (OpenShell >= 0.0.20).
+  // Create OpenShell providers for messaging/search credentials so they flow
+  // through the provider/placeholder system instead of raw env vars. The L7
+  // proxy rewrites provider-auth locations with real secrets at egress.
+  //
+  // `replaceExisting: true` is safe here because any prior sandbox was just
+  // deleted by the recreate path above, detaching its provider(s). For Brave
+  // this also migrates legacy `${sandbox}-brave-search` providers off the
+  // pre-fix `generic` type — `openshell provider update` cannot change the
+  // type, so delete+create is the only path that re-registers the provider
+  // under the `brave` profile that drives the X-Subscription-Token rewrite.
   const messagingProviders = [
-    ...new Set([...upsertMessagingProviders(messagingTokenDefs), ...reusableMessagingProviders]),
+    ...new Set([
+      ...upsertMessagingProviders(messagingTokenDefs, { replaceExisting: true }),
+      ...reusableMessagingProviders,
+    ]),
   ];
   for (const p of messagingProviders) {
     createArgs.push("--provider", p);
@@ -5527,13 +5589,6 @@ async function createSandbox(
     // Runtime-only: do not bake the per-sandbox broker token into image layers.
     envArgs.push(formatEnvAssignment("TOOL_GATEWAY_USER_TOKEN", hermesToolBrokerToken));
   }
-  if (webSearchConfig?.fetchEnabled) {
-    const braveKey =
-      getCredential(webSearch.BRAVE_API_KEY_ENV) || process.env[webSearch.BRAVE_API_KEY_ENV];
-    if (braveKey) {
-      envArgs.push(formatEnvAssignment(webSearch.BRAVE_API_KEY_ENV, braveKey));
-    }
-  }
   const sandboxReadyTimeoutSecs = getSandboxReadyTimeoutSecs(effectiveSandboxGpuConfig);
   const sandboxEnv = buildSubprocessEnv();
   // Remove host-infrastructure credentials that the generic allowlist
@@ -5709,15 +5764,6 @@ async function createSandbox(
       );
       throw error;
     }
-  }
-
-  // Verify web search config was actually accepted by the agent runtime.
-  // Hermes silently ignores unknown web.backend values (e.g. "brave" before
-  // upstream support lands), so we exec into the sandbox and check for a
-  // recognizable signal. OpenClaw validates at config-generation time, but
-  // this probe catches drift for all agents.
-  if (webSearchConfig?.fetchEnabled) {
-    verifyWebSearchInsideSandbox(sandboxName, agent);
   }
 
   // Release any stale forward on the dashboard port before claiming it for the new sandbox.
@@ -10106,6 +10152,15 @@ async function onboard(opts: OnboardOptions = {}): Promise<void> {
         "policies",
         toSessionUpdates({ sandboxName, provider, model, policyPresets: appliedPolicyPresets }),
       );
+    }
+
+    // Verify web search config was accepted by the agent runtime. Hermes
+    // silently ignores unknown web.backend values; OpenClaw validates at
+    // config-generation time but needs an egress probe to prove the L7
+    // proxy actually rewrites Brave's X-Subscription-Token header at the
+    // final, policy-applied state.
+    if (webSearchConfig?.fetchEnabled) {
+      verifyWebSearchInsideSandbox(sandboxName, agent);
     }
 
     if (agent) {
