@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: v2
+name: nemoclaw
+description: NemoClaw Python SDK controller — blueprint orchestration and sandbox management for OpenShell on Kubernetes.
+type: application
+# version and appVersion are patched to the release semver by CI before helm package.
+# appVersion doubles as the default image tag so a released chart pulls the matching SDK image.
+version: 0.0.0
+appVersion: "0.1.0"
+keywords:
+  - nemoclaw
+  - openshell
+  - sandbox
+  - agent
+home: https://github.com/NVIDIA/NemoClaw
+sources:
+  - https://github.com/NVIDIA/NemoClaw
+maintainers:
+  - name: NVIDIA Inc.

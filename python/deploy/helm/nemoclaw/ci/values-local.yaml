@@ -1,0 +1,17 @@
+image:
+  repository: localhost:5050/nemoclaw/python-sdk
+  tag: dev
+
+persistence:
+  enabled: false          # no storage needed for smoke tests
+
+openshell:
+  endpoint: "http://openshell.openshell.svc.cluster.local:8080"
+  tls:
+    # Gateway has disableTls: true in skaffold values — mount dummy secrets
+    # or create empty ones; the SDK won't actually verify certs in plaintext mode.
+    clientSecretName: "nemoclaw-dev-tls"
+    caSecretName: "nemoclaw-dev-tls"
+
+# Run a one-shot smoke test instead of staying alive
+command: ["python", "-m", "nemoclaw"]

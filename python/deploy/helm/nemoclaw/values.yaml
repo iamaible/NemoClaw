@@ -1,0 +1,126 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Default values for the NemoClaw Python SDK Helm chart.
+# Override with -f my-values.yaml or --set key=value.
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/nvidia/nemoclaw/python-sdk
+  pullPolicy: IfNotPresent
+  # Defaults to .Chart.AppVersion when empty.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  fsGroup: 1000
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 100
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# Override the default `python -m nemoclaw` command with your reconcile script.
+# Example (long-running status loop):
+#   command: ["python", "-u", "/scripts/reconcile.py"]
+command: []
+args: []
+
+# ── OpenShell gateway connection ─────────────────────────────────────────────
+
+openshell:
+  # gRPC endpoint of the OpenShell gateway.
+  # Typically the in-cluster service of the openshell Helm release.
+  endpoint: "https://openshell.openshell.svc.cluster.local:8080"
+
+  tls:
+    # Name of the Kubernetes Secret (type: kubernetes.io/tls) that holds the
+    # client certificate and key for mTLS to the gateway.
+    # This is the openshell-client-tls secret created by the openshell chart's
+    # PKI init job or cert-manager integration.
+    clientSecretName: "openshell-client-tls"
+
+    # Name of the Kubernetes Secret (key: ca.crt) holding the CA certificate
+    # used to verify the gateway's server certificate.
+    caSecretName: "openshell-server-client-ca"
+
+    # Mount path for TLS secrets inside the pod.
+    mountPath: "/etc/nemoclaw/tls"
+
+# ── NemoClaw state ────────────────────────────────────────────────────────────
+
+nemoclaw:
+  # Directory used for snapshots and the sandbox registry file.
+  # Mounted from the PVC when persistence.enabled is true; otherwise emptyDir.
+  stateDir: "/var/nemoclaw"
+
+  # Path to the sandbox registry JSON (relative to stateDir).
+  registryFile: ".nemoclaw/sandboxes.json"
+
+  # Log level passed to the Python logging module.
+  logLevel: "INFO"
+
+# ── Persistence (snapshots + registry) ───────────────────────────────────────
+
+persistence:
+  enabled: true
+  storageClass: ""
+  accessMode: ReadWriteOnce
+  size: "5Gi"
+  # Annotations on the PVC (e.g., for backup tooling).
+  annotations: {}
+
+# ── Resource limits ───────────────────────────────────────────────────────────
+
+resources: {}
+# Recommended starting point for production:
+#   requests:
+#     cpu: 100m
+#     memory: 128Mi
+#   limits:
+#     cpu: 500m
+#     memory: 256Mi
+
+# ── Scheduling ────────────────────────────────────────────────────────────────
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# ── Health probes ─────────────────────────────────────────────────────────────
+# Disabled by default because the default CMD exits immediately (one-shot).
+# Enable when running a long-lived controller process.
+probes:
+  enabled: false
+  liveness:
+    initialDelaySeconds: 10
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readiness:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+# ── Pod lifecycle ─────────────────────────────────────────────────────────────
+
+podLifecycle:
+  terminationGracePeriodSeconds: 30

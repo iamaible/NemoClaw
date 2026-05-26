@@ -758,6 +758,7 @@ RUN if [ "$NEMOCLAW_DARWIN_VM_COMPAT" = "1" ]; then \
             find "$p" -type d -exec chmod a+rwx {} +; \
         done; \
         chmod a+rw /sandbox/.nemoclaw/config.json; \
+        chown sandbox:sandbox /sandbox/.bashrc /sandbox/.profile; \
     fi
 
 # Health check: poll the gateway's /health endpoint so Docker (and Compose)

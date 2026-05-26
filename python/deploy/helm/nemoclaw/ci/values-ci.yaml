@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# CI / helm lint overrides.  Disables persistence and TLS secret references
+# that require a live cluster.
+
+image:
+  tag: "0.1.0-ci"
+
+persistence:
+  enabled: false
+
+openshell:
+  tls:
+    clientSecretName: "ci-client-tls"
+    caSecretName: "ci-ca-tls"
+
+serviceAccount:
+  create: true
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi

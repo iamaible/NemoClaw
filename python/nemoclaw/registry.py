@@ -57,6 +57,7 @@ class SandboxEntry:
     messaging_channel_config: dict[str, str] = field(default_factory=dict)
     disabled_channels: list[str] = field(default_factory=list)
     dashboard_port: int | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -117,6 +118,8 @@ def _entry_to_dict(e: SandboxEntry) -> dict[str, Any]:
         d["disabledChannels"] = sorted(e.disabled_channels)
     if e.dashboard_port is not None:
         d["dashboardPort"] = e.dashboard_port
+    if e.metadata:
+        d["metadata"] = e.metadata
     return d
 
 
@@ -155,6 +158,7 @@ def _entry_from_dict(d: dict[str, Any]) -> SandboxEntry:
         messaging_channel_config=dict(d.get("messagingChannelConfig") or {}),
         disabled_channels=list(d.get("disabledChannels") or []),
         dashboard_port=d.get("dashboardPort"),
+        metadata=dict(d.get("metadata") or {}),
     )
 
 

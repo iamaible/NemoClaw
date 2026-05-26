@@ -1,0 +1,35 @@
+# NemoClaw Python SDK — Docker build excludes
+# Build context is the workspace root.
+#
+# Docker whitelist pattern: start with ** (exclude everything), then
+# re-include EACH ancestor directory explicitly before the target paths —
+# omitting a parent silently excludes all its children even if listed below.
+
+**
+
+# ── OpenShell Python SDK (local monorepo dep) ────────────────────────────────
+!OpenShell/
+!OpenShell/python/
+!OpenShell/python/**
+OpenShell/python/.venv/
+OpenShell/python/.venv/**
+OpenShell/python/.pytest_cache/
+OpenShell/python/.pytest_cache/**
+OpenShell/python/**/__pycache__/
+OpenShell/python/**/*.pyc
+
+# ── NemoClaw Python package ───────────────────────────────────────────────────
+!NemoClaw/
+!NemoClaw/python/
+!NemoClaw/python/pyproject.toml
+!NemoClaw/python/uv.lock
+!NemoClaw/python/README.md
+!NemoClaw/python/nemoclaw/
+!NemoClaw/python/nemoclaw/**
+NemoClaw/python/nemoclaw/**/__pycache__/
+NemoClaw/python/nemoclaw/**/*.pyc
+NemoClaw/python/nemoclaw/**/*_test.py
+NemoClaw/python/.venv/
+NemoClaw/python/.venv/**
+NemoClaw/python/.pytest_cache/
+NemoClaw/python/.pytest_cache/**
