@@ -4226,7 +4226,15 @@ async function selectAndValidateOllamaModel(
     );
     if (validation.retry === "selection") return { outcome: "back-to-selection" };
     if (!validation.ok) {
-      if (isNonInteractive()) process.exit(1);
+      if (isNonInteractive()) {
+        console.error(
+          `  [non-interactive] Aborting: model '${selectedModel}' failed validation for the selected Ollama provider.`,
+        );
+        console.error(
+          "  Override with NEMOCLAW_MODEL=<model> or re-run interactively to choose a different model.",
+        );
+        process.exit(1);
+      }
       continue;
     }
     // Ollama's /v1/responses endpoint does not produce correctly formatted
@@ -5275,7 +5283,12 @@ async function setupNim(
           ? installOllamaOnMacOS({ isNonInteractive, isUpgrade })
           : installOllamaOnLinux({ isNonInteractive, isUpgrade });
         if (!installResult.ok) {
-          if (isNonInteractive()) process.exit(1);
+          if (isNonInteractive()) {
+            console.error(
+              "  [non-interactive] Aborting: Ollama install failed. See errors above.",
+            );
+            process.exit(1);
+          }
           continue selectionLoop;
         }
         const upgradeCheck = assertOllamaUpgradeApplied(ollamaInstallMenu);
@@ -5322,7 +5335,12 @@ async function setupNim(
           promptFn: prompt,
         });
         if (!result.ok) {
-          if (isNonInteractive()) process.exit(1);
+          if (isNonInteractive()) {
+            console.error(
+              "  [non-interactive] Aborting: vLLM install failed. See errors above.",
+            );
+            process.exit(1);
+          }
           continue selectionLoop;
         }
         // Fall through to the same provider/model setup as the running-vLLM
