@@ -322,8 +322,10 @@ const {
   ensureSwap,
   getDockerBridgeGatewayIp,
   getMemoryInfo,
+  isFatalContainerDnsProbeFailure,
   planHostRemediation,
   probeContainerDns,
+  probeDockerBridgeContainerStart,
 } = preflightUtils;
 const agentOnboard = require("./agent/onboard");
 const agentDefs = require("./agent/defs");
@@ -3336,6 +3338,280 @@ function assertCdiNvidiaGpuSpecPresent(
   process.exit(1);
 }
 
+function printDockerBridgeContainerStartFailure(
+  result: import("./onboard/preflight").DockerBridgeContainerStartProbeResult,
+): void {
+  console.error("  ✗ Docker could not start a bridge-network test container.");
+  if (result.details) {
+    for (const line of String(result.details).split("\n").slice(-4)) {
+      if (line.trim()) console.error(`    ${line.trim()}`);
+    }
+  }
+  console.error("");
+  if (result.reason === "veth_unsupported") {
+    console.error(
+      "  Docker reported that creating the container veth pair is not supported.",
+    );
+    console.error(
+      "  This matches the Jetson kernel/Docker bridge failure seen before long sandbox builds.",
+    );
+    console.error(
+      "  Update the Jetson Linux kernel/Docker bridge networking support, or run NemoClaw on",
+    );
+    console.error("  a host whose Docker bridge networking can create veth interfaces.");
+  } else if (result.reason === "timeout" || result.reason === "killed") {
+    console.error("  Docker did not complete a minimal bridge container start probe in time.");
+    console.error("  Restart Docker and check for stuck container/network operations before retrying.");
+  } else if (result.reason === "docker_daemon_unreachable") {
+    console.error("  The Docker CLI cannot reach the Docker daemon (dockerd is down or wedged).");
+    console.error(
+      "  Restart the Docker daemon (`sudo systemctl restart docker`, or restart Docker Desktop/Colima)",
+    );
+    console.error("  and re-run `nemoclaw onboard`.");
+  } else if (result.reason === "image_pull_failed") {
+    console.error("  Docker could not pull the busybox test image needed for the preflight probe.");
+    console.error("  Ensure the Docker daemon can reach its registry, then retry onboarding.");
+  } else {
+    console.error("  Docker returned an unexpected failure for a minimal bridge container.");
+    console.error("  Restart Docker and retry onboarding after verifying bridge networking.");
+  }
+  console.error("");
+  console.error("  Verify outside NemoClaw:");
+  console.error("    docker run --rm --network bridge busybox:latest true");
+}
+
+/**
+ * Bridge + DNS preflight checks extracted so `--resume` can call them
+ * as a backstop. The cached `preflight` step does not capture host
+ * Docker/DNS state, and the original attempt that wrote the cache may
+ * have aborted later at sandbox build with exactly the #3508/#3630
+ * failure modes. Resuming without re-checking would walk into the same
+ * wall (mirroring the [[assertCdiNvidiaGpuSpecPresent]] resume backstop
+ * pattern at #3152).
+ */
+function assertDockerBridgeAndContainerDnsHealthy(
+  host: ReturnType<typeof assessHost>,
+): void {
+  // A minimal bridge-backed container start catches Docker/kernel failures
+  // (notably Jetson veth "operation not supported") before longer gateway or
+  // sandbox build work starts. Only veth/timeout/killed/daemon-unreachable
+  // reasons are definitively a bridge problem; image_pull_failed (e.g. Hub
+  // rate limit, proxy outage, registry DNS — handled in the DNS probe below)
+  // and bare `error` (e.g. a daemon that disabled the default bridge but
+  // uses a managed one) stay inconclusive.
+  const bridgeStart = probeDockerBridgeContainerStart();
+  if (bridgeStart.ok) {
+    console.log("  ✓ Docker can start bridge containers");
+  } else if (
+    bridgeStart.reason === "veth_unsupported" ||
+    bridgeStart.reason === "timeout" ||
+    bridgeStart.reason === "killed" ||
+    bridgeStart.reason === "docker_daemon_unreachable"
+  ) {
+    printDockerBridgeContainerStartFailure(bridgeStart);
+    process.exit(1);
+  } else {
+    console.warn(
+      `  ⚠ Bridge container start probe inconclusive (reason: ${bridgeStart.reason ?? "unknown"}).`,
+    );
+    if (bridgeStart.details) {
+      for (const line of String(bridgeStart.details).split("\n").slice(-3)) {
+        if (line.trim()) console.warn(`    ${line.trim()}`);
+      }
+    }
+    console.warn("    Continuing to DNS probe for more specific diagnosis.");
+  }
+
+  // DNS resolution from inside containers (#2101). A corp firewall that
+  // blocks outbound UDP:53 to public resolvers leaves the sandbox build
+  // unable to resolve registry.npmjs.org; npm then retries for ~15 min and
+  // prints the cryptic `Exit handler never called`.
+  const dns = probeContainerDns();
+  const dnsIsFatal = isFatalContainerDnsProbeFailure(dns);
+
+  if (dns.ok) {
+    console.log("  ✓ Container DNS resolution works");
+    return;
+  }
+  if (!dnsIsFatal) {
+    if (dns.reason === "image_pull_failed") {
+      console.warn(
+        "  ⚠ Container DNS probe inconclusive: docker couldn't pull the busybox test image.",
+      );
+      console.warn("    This usually means the docker daemon itself can't reach Docker Hub,");
+      console.warn(
+        "    but doesn't prove container DNS is broken — the sandbox build may still succeed.",
+      );
+    } else {
+      console.warn(`  ⚠ Container DNS probe inconclusive (reason: ${dns.reason ?? "unknown"}).`);
+    }
+    if (dns.details) {
+      for (const line of String(dns.details).split("\n").slice(-3)) {
+        if (line.trim()) console.warn(`    ${line.trim()}`);
+      }
+    }
+    console.warn("    Proceeding. If the sandbox build later hangs at `npm ci`, see issue #2101.");
+    return;
+  }
+
+  if (dns.reason === "veth_unsupported") {
+    printDockerBridgeContainerStartFailure({
+      ok: false,
+      reason: "veth_unsupported",
+      details: dns.details,
+      timedOut: dns.timedOut,
+      exitCode: dns.exitCode,
+      signal: dns.signal,
+    });
+    process.exit(1);
+  }
+  if (dns.reason === "docker_daemon_unreachable") {
+    printDockerBridgeContainerStartFailure({
+      ok: false,
+      reason: "docker_daemon_unreachable",
+      details: dns.details,
+      timedOut: dns.timedOut,
+      exitCode: dns.exitCode,
+      signal: dns.signal,
+    });
+    process.exit(1);
+  }
+  if (dns.reason === "timeout" || dns.reason === "killed") {
+    console.error("  ✗ Container DNS probe did not complete.");
+  } else if (dns.reason === "image_pull_failed") {
+    console.error("  ✗ Docker could not resolve or pull the DNS probe image.");
+  } else {
+    console.error("  ✗ DNS resolution from inside a docker container failed.");
+  }
+  if (dns.details) {
+    for (const line of String(dns.details).split("\n").slice(-4)) {
+      if (line.trim()) console.error(`    ${line.trim()}`);
+    }
+  }
+  console.error("");
+  printContainerDnsRemediation(host);
+  process.exit(1);
+}
+
+function printContainerDnsRemediation(host: ReturnType<typeof assessHost>): void {
+  console.error("  The sandbox build runs `npm ci` inside a container and needs to resolve");
+  console.error("  registry.npmjs.org. On networks that block outbound UDP:53 to public DNS");
+  console.error("  (common in corporate environments that force DNS-over-TLS on the host),");
+  console.error("  the build appears to hang for ~15 minutes and then prints the cryptic");
+  console.error("  `npm error Exit handler never called`. See issue #2101.");
+  console.error("");
+  console.error("  Fix options:");
+  console.error("");
+
+  // Platform-aware remediation hints. The systemd-resolved fix is
+  // Linux-specific; macOS / Windows / WSL-backed-by-Docker-Desktop
+  // hosts configure DNS through Docker Desktop's GUI or a
+  // platform-specific daemon.json path, so we avoid printing shell
+  // commands that would mislead those users.
+  const isLinuxWithSystemd =
+    host.platform === "linux" && !host.isWsl && host.systemctlAvailable;
+
+  const printLinuxFix = (bridgeIp: string, note: string | null) => {
+    if (note) console.error(note);
+    console.error("       sudo mkdir -p /etc/systemd/resolved.conf.d/");
+    console.error(
+      `       printf '[Resolve]\\nDNSStubListenerExtra=${bridgeIp}\\n' | sudo tee /etc/systemd/resolved.conf.d/docker-bridge.conf`,
+    );
+    console.error("       sudo systemctl restart systemd-resolved");
+    console.error("");
+    console.error(
+      "     Then add the dns key to /etc/docker/daemon.json (safely merges with existing config if jq is installed):",
+    );
+    console.error(
+      "       sudo cp /etc/docker/daemon.json /etc/docker/daemon.json.bak-$(date +%s) 2>/dev/null",
+    );
+    console.error(
+      `       { sudo jq '. + {"dns":["${bridgeIp}"]}' /etc/docker/daemon.json 2>/dev/null || echo '{"dns":["${bridgeIp}"]}'; } | sudo tee /etc/docker/daemon.json.new >/dev/null`,
+    );
+    console.error("       sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json");
+    console.error("       sudo systemctl restart docker");
+  };
+
+  if (isLinuxWithSystemd) {
+    const detectedBridgeIp = getDockerBridgeGatewayIp();
+    const bridgeIp = detectedBridgeIp || "172.17.0.1";
+    let bridgeNote: string | null = null;
+    if (detectedBridgeIp && detectedBridgeIp !== "172.17.0.1") {
+      bridgeNote = `     (detected your docker bridge gateway at ${detectedBridgeIp})`;
+    } else if (!detectedBridgeIp) {
+      bridgeNote =
+        "     (could not auto-detect bridge IP; using docker's default — verify with:\n" +
+        "      docker network inspect bridge --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}')";
+    }
+    console.error("  1. Make systemd-resolved reachable from containers (recommended):");
+    printLinuxFix(bridgeIp, bridgeNote);
+    console.error("");
+    console.error("  2. Configure an explicit UDP:53-capable DNS in /etc/docker/daemon.json");
+    console.error("     (ask your IT team for an internal DNS server IP).");
+  } else if (host.platform === "darwin") {
+    if (host.runtime === "colima") {
+      console.error("  Configure Colima's DNS (macOS):");
+      console.error("       colima stop");
+      console.error("       colima start --dns <corp-dns-ip>");
+      console.error("     (or edit ~/.colima/default/colima.yaml and `colima restart`)");
+    } else if (host.runtime === "docker-desktop" || host.runtime === "docker") {
+      console.error("  Configure Docker Desktop's DNS (macOS):");
+      console.error(
+        "       cp ~/.docker/daemon.json ~/.docker/daemon.json.bak-$(date +%s) 2>/dev/null",
+      );
+      console.error(
+        `       { jq '. + {"dns":["<corp-dns-ip>"]}' ~/.docker/daemon.json 2>/dev/null || echo '{"dns":["<corp-dns-ip>"]}'; } > ~/.docker/daemon.json.new && mv ~/.docker/daemon.json.new ~/.docker/daemon.json`,
+      );
+      console.error("       osascript -e 'quit app \"Docker\"' && sleep 3 && open -a Docker");
+      console.error(
+        "     (or do the same via the Docker Desktop UI: Settings → Docker Engine)",
+      );
+    } else {
+      console.error("  Configure your container runtime's DNS (macOS):");
+      console.error("     - Docker Desktop:");
+      console.error(
+        '         { jq \'. + {"dns":["<corp-dns-ip>"]}\' ~/.docker/daemon.json 2>/dev/null || echo \'{"dns":["<corp-dns-ip>"]}\'; } > ~/.docker/daemon.json.new && mv ~/.docker/daemon.json.new ~/.docker/daemon.json',
+      );
+      console.error("         osascript -e 'quit app \"Docker\"' && sleep 3 && open -a Docker");
+      console.error("     - Colima:");
+      console.error("         colima stop && colima start --dns <corp-dns-ip>");
+      console.error("     - Rancher Desktop / Podman: edit the runtime's DNS config");
+      console.error("       and restart it.");
+    }
+    console.error("     Ask your IT team for an internal DNS server IP that accepts UDP:53.");
+  } else if (host.platform === "win32" || host.isWsl) {
+    console.error("  1. Configure Docker Desktop's DNS (Windows / WSL via Docker Desktop):");
+    console.error(
+      "       Docker Desktop for Windows → Settings → Docker Engine — edit the JSON to add:",
+    );
+    console.error('         { "dns": ["<corp-dns-ip>"] }');
+    console.error("       Then click Apply & Restart.");
+    console.error("");
+    console.error(
+      "  2. If you run docker natively inside WSL (not Docker Desktop), apply the Linux fix:",
+    );
+    const wslBridgeIp = getDockerBridgeGatewayIp();
+    let wslBridgeNote: string | null = null;
+    if (wslBridgeIp && wslBridgeIp !== "172.17.0.1") {
+      wslBridgeNote = `     (detected your docker bridge gateway at ${wslBridgeIp})`;
+    } else if (!wslBridgeIp) {
+      wslBridgeNote =
+        "     (could not auto-detect bridge IP — the snippet below uses docker's default; verify with:\n" +
+        "      docker network inspect bridge --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}')";
+    }
+    printLinuxFix(wslBridgeIp || "172.17.0.1", wslBridgeNote);
+  } else {
+    console.error("  Configure your docker daemon to use a DNS server that accepts UDP:53.");
+    console.error(
+      '  Add { "dns": ["<corp-dns-ip>"] } to your docker daemon.json and restart the daemon.',
+    );
+    console.error("  Ask your IT team for an internal DNS server IP.");
+  }
+  console.error("");
+  console.error("  Verify the fix worked:");
+  console.error("    docker run --rm busybox nslookup registry.npmjs.org");
+}
+
 type PreflightOptions = Pick<
   OnboardOptions,
   "sandboxGpu" | "sandboxGpuDevice" | "gpu" | "noGpu"
@@ -3362,173 +3638,7 @@ async function preflight(
     preflightOpts.optedOutGpuPassthrough === true || preflightOpts.noGpu === true;
   assertCdiNvidiaGpuSpecPresent(host, optedOutGpuPassthrough);
 
-  // DNS resolution from inside containers (#2101). A corp firewall that
-  // blocks outbound UDP:53 to public resolvers leaves the sandbox build
-  // unable to resolve registry.npmjs.org; npm then retries for ~15 min and
-  // prints the cryptic `Exit handler never called`.
-  const dns = probeContainerDns();
-  // Only reasons where the probe actually *ran* nslookup and observed a DNS
-  // failure warrant blocking — other reasons are inconclusive (probe itself
-  // couldn't run, got killed, etc.) and shouldn't fail a valid environment.
-  const dnsIsFatal = dns.reason === "servers_unreachable" || dns.reason === "resolution_failed";
-
-  if (dns.ok) {
-    console.log("  ✓ Container DNS resolution works");
-  } else if (!dnsIsFatal) {
-    // Inconclusive probe — warn but proceed. If the sandbox build really
-    // does hit a DNS issue, the user will see #2101 pointers in that layer.
-    if (dns.reason === "image_pull_failed") {
-      console.warn(
-        "  ⚠ Container DNS probe inconclusive: docker couldn't pull the busybox test image.",
-      );
-      console.warn("    This usually means the docker daemon itself can't reach Docker Hub,");
-      console.warn(
-        "    but doesn't prove container DNS is broken — the sandbox build may still succeed.",
-      );
-    } else {
-      console.warn(`  ⚠ Container DNS probe inconclusive (reason: ${dns.reason ?? "unknown"}).`);
-    }
-    if (dns.details) {
-      for (const line of String(dns.details).split("\n").slice(-3)) {
-        if (line.trim()) console.warn(`    ${line.trim()}`);
-      }
-    }
-    console.warn("    Proceeding. If the sandbox build later hangs at `npm ci`, see issue #2101.");
-  } else {
-    console.error("  ✗ DNS resolution from inside a docker container failed.");
-    if (dns.details) {
-      for (const line of String(dns.details).split("\n").slice(-4)) {
-        if (line.trim()) console.error(`    ${line.trim()}`);
-      }
-    }
-    console.error("");
-    {
-      console.error("  The sandbox build runs `npm ci` inside a container and needs to resolve");
-      console.error("  registry.npmjs.org. On networks that block outbound UDP:53 to public DNS");
-      console.error("  (common in corporate environments that force DNS-over-TLS on the host),");
-      console.error("  the build appears to hang for ~15 minutes and then prints the cryptic");
-      console.error("  `npm error Exit handler never called`. See issue #2101.");
-      console.error("");
-      console.error("  Fix options:");
-      console.error("");
-
-      // Platform-aware remediation hints. The systemd-resolved fix is
-      // Linux-specific; macOS / Windows / WSL-backed-by-Docker-Desktop
-      // hosts configure DNS through Docker Desktop's GUI or a
-      // platform-specific daemon.json path, so we avoid printing shell
-      // commands that would mislead those users.
-      const isLinuxWithSystemd =
-        host.platform === "linux" && !host.isWsl && host.systemctlAvailable;
-
-      const printLinuxFix = (bridgeIp: string, note: string | null) => {
-        if (note) console.error(note);
-        console.error("       sudo mkdir -p /etc/systemd/resolved.conf.d/");
-        console.error(
-          `       printf '[Resolve]\\nDNSStubListenerExtra=${bridgeIp}\\n' | sudo tee /etc/systemd/resolved.conf.d/docker-bridge.conf`,
-        );
-        console.error("       sudo systemctl restart systemd-resolved");
-        console.error("");
-        console.error(
-          "     Then add the dns key to /etc/docker/daemon.json (safely merges with existing config if jq is installed):",
-        );
-        console.error(
-          "       sudo cp /etc/docker/daemon.json /etc/docker/daemon.json.bak-$(date +%s) 2>/dev/null",
-        );
-        console.error(
-          `       { sudo jq '. + {"dns":["${bridgeIp}"]}' /etc/docker/daemon.json 2>/dev/null || echo '{"dns":["${bridgeIp}"]}'; } | sudo tee /etc/docker/daemon.json.new >/dev/null`,
-        );
-        console.error("       sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json");
-        console.error("       sudo systemctl restart docker");
-      };
-
-      if (isLinuxWithSystemd) {
-        const detectedBridgeIp = getDockerBridgeGatewayIp();
-        const bridgeIp = detectedBridgeIp || "172.17.0.1";
-        let bridgeNote: string | null = null;
-        if (detectedBridgeIp && detectedBridgeIp !== "172.17.0.1") {
-          bridgeNote = `     (detected your docker bridge gateway at ${detectedBridgeIp})`;
-        } else if (!detectedBridgeIp) {
-          bridgeNote =
-            "     (could not auto-detect bridge IP; using docker's default — verify with:\n" +
-            "      docker network inspect bridge --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}')";
-        }
-        console.error("  1. Make systemd-resolved reachable from containers (recommended):");
-        printLinuxFix(bridgeIp, bridgeNote);
-        console.error("");
-        console.error("  2. Configure an explicit UDP:53-capable DNS in /etc/docker/daemon.json");
-        console.error("     (ask your IT team for an internal DNS server IP).");
-      } else if (host.platform === "darwin") {
-        // On macOS, branch by the detected runtime (host.runtime) so users get
-        // shell commands they can actually paste, not a "click this GUI" hint.
-        if (host.runtime === "colima") {
-          console.error("  Configure Colima's DNS (macOS):");
-          console.error("       colima stop");
-          console.error("       colima start --dns <corp-dns-ip>");
-          console.error("     (or edit ~/.colima/default/colima.yaml and `colima restart`)");
-        } else if (host.runtime === "docker-desktop" || host.runtime === "docker") {
-          console.error("  Configure Docker Desktop's DNS (macOS):");
-          console.error(
-            "       cp ~/.docker/daemon.json ~/.docker/daemon.json.bak-$(date +%s) 2>/dev/null",
-          );
-          console.error(
-            `       { jq '. + {"dns":["<corp-dns-ip>"]}' ~/.docker/daemon.json 2>/dev/null || echo '{"dns":["<corp-dns-ip>"]}'; } > ~/.docker/daemon.json.new && mv ~/.docker/daemon.json.new ~/.docker/daemon.json`,
-          );
-          console.error("       osascript -e 'quit app \"Docker\"' && sleep 3 && open -a Docker");
-          console.error(
-            "     (or do the same via the Docker Desktop UI: Settings → Docker Engine)",
-          );
-        } else {
-          // Unknown / podman / other
-          console.error("  Configure your container runtime's DNS (macOS):");
-          console.error("     - Docker Desktop:");
-          console.error(
-            '         { jq \'. + {"dns":["<corp-dns-ip>"]}\' ~/.docker/daemon.json 2>/dev/null || echo \'{"dns":["<corp-dns-ip>"]}\'; } > ~/.docker/daemon.json.new && mv ~/.docker/daemon.json.new ~/.docker/daemon.json',
-          );
-          console.error("         osascript -e 'quit app \"Docker\"' && sleep 3 && open -a Docker");
-          console.error("     - Colima:");
-          console.error("         colima stop && colima start --dns <corp-dns-ip>");
-          console.error("     - Rancher Desktop / Podman: edit the runtime's DNS config");
-          console.error("       and restart it.");
-        }
-        console.error("     Ask your IT team for an internal DNS server IP that accepts UDP:53.");
-      } else if (host.platform === "win32" || host.isWsl) {
-        console.error("  1. Configure Docker Desktop's DNS (Windows / WSL via Docker Desktop):");
-        console.error(
-          "       Docker Desktop for Windows → Settings → Docker Engine — edit the JSON to add:",
-        );
-        console.error('         { "dns": ["<corp-dns-ip>"] }');
-        console.error("       Then click Apply & Restart.");
-        console.error("");
-        console.error(
-          "  2. If you run docker natively inside WSL (not Docker Desktop), apply the Linux fix:",
-        );
-        // Reuse the same bridge-IP detection the Linux branch uses — a
-        // native-docker-in-WSL install can have a custom bridge subnet
-        // just like any other Linux host, so a hardcoded 172.17.0.1
-        // would break those users' copy-paste.
-        const wslBridgeIp = getDockerBridgeGatewayIp();
-        let wslBridgeNote: string | null = null;
-        if (wslBridgeIp && wslBridgeIp !== "172.17.0.1") {
-          wslBridgeNote = `     (detected your docker bridge gateway at ${wslBridgeIp})`;
-        } else if (!wslBridgeIp) {
-          wslBridgeNote =
-            "     (could not auto-detect bridge IP — the snippet below uses docker's default; verify with:\n" +
-            "      docker network inspect bridge --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}')";
-        }
-        printLinuxFix(wslBridgeIp || "172.17.0.1", wslBridgeNote);
-      } else {
-        console.error("  Configure your docker daemon to use a DNS server that accepts UDP:53.");
-        console.error(
-          '  Add { "dns": ["<corp-dns-ip>"] } to your docker daemon.json and restart the daemon.',
-        );
-        console.error("  Ask your IT team for an internal DNS server IP.");
-      }
-      console.error("");
-      console.error("  Verify the fix worked:");
-      console.error("    docker run --rm busybox nslookup registry.npmjs.org");
-    }
-    process.exit(1);
-  }
+  assertDockerBridgeAndContainerDnsHealthy(host);
 
   if (host.runtime !== "unknown") {
     console.log(`  ✓ Container runtime: ${host.runtime}`);
@@ -9414,7 +9524,13 @@ async function onboard(opts: OnboardOptions = {}): Promise<void> {
       // resolution is replayed a few lines below for `gpuPassthrough`).
       const resumeOptedOutGpuPassthrough =
         opts.noGpu === true || (opts.gpu !== true && session?.gpuPassthrough === false);
-      assertCdiNvidiaGpuSpecPresent(assessHost(), resumeOptedOutGpuPassthrough);
+      const resumeHost = assessHost();
+      assertCdiNvidiaGpuSpecPresent(resumeHost, resumeOptedOutGpuPassthrough);
+      // Resume backstop for #3508/#3630: the cached preflight step does
+      // not capture host Docker/DNS state, and a session written by an
+      // older NemoClaw may not have run the new bridge/DNS fatal checks
+      // (mirrors the assertCdiNvidiaGpuSpecPresent resume pattern).
+      assertDockerBridgeAndContainerDnsHealthy(resumeHost);
       validateSandboxGpuPreflight(
         resolveSandboxGpuConfig(gpu, {
           flag: effectiveSandboxGpuFlag,

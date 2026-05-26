@@ -108,6 +108,81 @@ describe("isSandboxBridgeGatewayReachable", () => {
     expect(result.reason).toBe("probe_unavailable");
   });
 
+  it("flags veth operation-not-supported as a fatal bridge failure", async () => {
+    const result = await isSandboxBridgeGatewayReachable({
+      inspectNetworkImpl: () => ({ subnet: "172.19.0.0/16", gatewayIp: "172.19.0.1" }),
+      usesHostGatewayRouteImpl: () => false,
+      runImpl: () => ({
+        status: 125,
+        stderr:
+          "docker: Error response from daemon: failed to add the host <=> sandbox veth pair interfaces: operation not supported.",
+      }),
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("veth_unsupported");
+    expect(result.detail).toContain("operation not supported");
+  });
+
+  it("flags docker probe timeouts separately from inconclusive probe failures", async () => {
+    const result = await isSandboxBridgeGatewayReachable({
+      inspectNetworkImpl: () => ({ subnet: "172.19.0.0/16", gatewayIp: "172.19.0.1" }),
+      usesHostGatewayRouteImpl: () => false,
+      runImpl: () => ({
+        status: null,
+        signal: "SIGTERM",
+        error: "spawnSync docker ETIMEDOUT",
+      }),
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("probe_timeout");
+    expect(result.detail).toContain("ETIMEDOUT");
+  });
+
+  it("keeps tcp_failed for BusyBox nc connection-level 'Operation timed out' stderr (UFW remediation path)", async () => {
+    const result = await isSandboxBridgeGatewayReachable({
+      inspectNetworkImpl: () => ({ subnet: "172.19.0.0/16", gatewayIp: "172.19.0.1" }),
+      usesHostGatewayRouteImpl: () => false,
+      runImpl: () => ({
+        status: 1,
+        stderr: "nc: host.openshell.internal (172.19.0.1:8080): Operation timed out",
+      }),
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("tcp_failed");
+  });
+
+  it("downgrades a slow-registry pre-pull timeout to probe_unavailable (not fatal probe_timeout) (#3630 codex review)", async () => {
+    const result = await isSandboxBridgeGatewayReachable({
+      inspectNetworkImpl: () => ({ subnet: "172.19.0.0/16", gatewayIp: "172.19.0.1" }),
+      usesHostGatewayRouteImpl: () => false,
+      runImpl: () => ({ status: 0 }),
+      ensureImageCachedOverride: {
+        ok: false,
+        reason: "pull_timeout",
+        details: "docker pull timed out after 60s",
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("probe_unavailable");
+    expect(result.detail).toContain("timed out");
+  });
+
+  it("escalates inspect_unavailable to fatal docker_daemon_unreachable (#3630 codex review)", async () => {
+    const result = await isSandboxBridgeGatewayReachable({
+      inspectNetworkImpl: () => ({ subnet: "172.19.0.0/16", gatewayIp: "172.19.0.1" }),
+      usesHostGatewayRouteImpl: () => false,
+      runImpl: () => ({ status: 0 }),
+      ensureImageCachedOverride: {
+        ok: false,
+        reason: "inspect_unavailable",
+        details: "Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("docker_daemon_unreachable");
+    expect(result.detail).toContain("Cannot connect to the Docker daemon");
+  });
+
   it("flags tcp_failed only after the OpenShell route was modeled", async () => {
     const result = await isSandboxBridgeGatewayReachable({
       inspectNetworkImpl: () => ({ subnet: "172.19.0.0/16", gatewayIp: "172.19.0.1" }),
@@ -154,6 +229,41 @@ describe("formatSandboxBridgeUnreachableMessage", () => {
     expect(msg).toContain("Could not verify sandbox bridge reachability");
     expect(msg).toContain("continuing");
     expect(msg).not.toContain("ufw allow");
+  });
+
+  it("emits a fatal veth message without treating it as inconclusive", () => {
+    const msg = formatSandboxBridgeUnreachableMessage({
+      ok: false,
+      reason: "veth_unsupported",
+      detail:
+        "docker: Error response from daemon: failed to add the host <=> sandbox veth pair interfaces: operation not supported.",
+    });
+    expect(msg).toContain("could not create the sandbox bridge veth pair");
+    expect(msg).toContain("operation not supported");
+    expect(msg).not.toContain("continuing");
+  });
+
+  it("emits a fatal timeout message without treating it as inconclusive", () => {
+    const msg = formatSandboxBridgeUnreachableMessage({
+      ok: false,
+      reason: "probe_timeout",
+      detail: "spawnSync docker ETIMEDOUT",
+    });
+    expect(msg).toContain("probe timed out");
+    expect(msg).toContain("ETIMEDOUT");
+    expect(msg).not.toContain("continuing");
+  });
+
+  it("emits a fatal docker_daemon_unreachable message with daemon restart hint", () => {
+    const msg = formatSandboxBridgeUnreachableMessage({
+      ok: false,
+      reason: "docker_daemon_unreachable",
+      detail: "Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+    });
+    expect(msg).toContain("Docker daemon is not reachable");
+    expect(msg).toContain("Cannot connect to the Docker daemon");
+    expect(msg).toMatch(/Restart the Docker daemon|systemctl restart docker|Docker Desktop/);
+    expect(msg).not.toContain("continuing");
   });
 
   it("does not emit a UFW command for host-gateway routing failures", () => {

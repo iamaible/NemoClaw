@@ -21,7 +21,13 @@ const HOST_DOCKER_INTERNAL_NAME = "host.docker.internal";
 const DEFAULT_PROBE_TIMEOUT_SEC = 5;
 const PROBE_RUN_OVERHEAD_MS = 10_000;
 
-export type SandboxBridgeReachabilityReason = "ok" | "tcp_failed" | "probe_unavailable";
+export type SandboxBridgeReachabilityReason =
+  | "ok"
+  | "tcp_failed"
+  | "probe_unavailable"
+  | "probe_timeout"
+  | "veth_unsupported"
+  | "docker_daemon_unreachable";
 export type SandboxBridgeRouteKind = "bridge_gateway" | "host_gateway";
 
 export interface DockerBridgeNetworkInfo {
@@ -63,6 +69,8 @@ export interface SandboxBridgeReachabilityOptions {
   runImpl?: (args: readonly string[], timeoutMs: number) => SandboxBridgeProbeRunResult;
   inspectNetworkImpl?: (networkName: string) => DockerBridgeNetworkInfo | undefined;
   usesHostGatewayRouteImpl?: () => boolean;
+  /** Inject a precomputed image-cache result; bypasses real pre-pull. */
+  ensureImageCachedOverride?: import("./preflight").EnsureProbeImageCachedResult;
 }
 
 function parseDockerNetworkIpamConfig(raw: string): DockerBridgeNetworkInfo | undefined {
@@ -174,6 +182,24 @@ function isNameResolutionFailure(detail: string): boolean {
   );
 }
 
+function isProbeTimeout(result: SandboxBridgeProbeRunResult): boolean {
+  // Only spawn-level timeouts qualify here. BusyBox `nc` exits with
+  // status 1 and prints "Operation timed out" on connection-level
+  // timeouts (firewalled gateway port) — those must fall through to
+  // `tcp_failed` so the user gets the UFW/firewall remediation, not a
+  // Docker restart hint.
+  return (
+    /ETIMEDOUT/i.test(result.error ?? "") ||
+    Boolean(result.signal && result.status === null)
+  );
+}
+
+function isVethUnsupported(detail: string): boolean {
+  return /veth|failed to add the host .* sandbox .* interfaces|operation not supported/i.test(
+    detail,
+  );
+}
+
 function buildProbeArgs(
   route: OpenShellDockerRoute,
   probeImage: string,
@@ -222,6 +248,36 @@ export async function isSandboxBridgeGatewayReachable(
     };
   }
 
+  // Pre-pull the pinned probe image so a slow-registry cold-cache pull
+  // does not get charged against the (much shorter) probe budget and
+  // misclassified as a fatal probe_timeout. Image-cache failures stay
+  // inconclusive (probe_unavailable), matching pre-#3630 semantics.
+  //
+  // Test seams that inject a probe runImpl bypass real Docker entirely;
+  // skip the pre-pull there unless the test supplies an explicit
+  // ensureImageCachedOverride.
+  if (opts.ensureImageCachedOverride !== undefined || opts.runImpl === undefined) {
+    const { ensureProbeImageCached } = require("./preflight") as typeof import("./preflight");
+    const cached = opts.ensureImageCachedOverride ?? ensureProbeImageCached(probeImage);
+    if (!cached.ok) {
+      // A wedged docker daemon (inspect_unavailable) is a fatal Docker
+      // outage, not a probe/pull uncertainty — keep onboarding from
+      // proceeding into sandbox work that will hang. Pull failures
+      // (rate limit / slow registry) remain probe_unavailable.
+      const reason: SandboxBridgeReachabilityReason =
+        cached.reason === "inspect_unavailable" ? "docker_daemon_unreachable" : "probe_unavailable";
+      return {
+        ok: false,
+        reason,
+        networkName,
+        subnet: route.subnet,
+        gatewayIp: route.gatewayIp,
+        routeKind: route.routeKind,
+        detail: cached.details ?? `docker pull ${probeImage} did not complete`,
+      };
+    }
+  }
+
   const result = runImpl(
     buildProbeArgs(route, probeImage, timeoutSec, port),
     timeoutSec * 1000 + PROBE_RUN_OVERHEAD_MS,
@@ -238,6 +294,28 @@ export async function isSandboxBridgeGatewayReachable(
   }
 
   const detail = summarizeProbeResult(result);
+  if (isVethUnsupported(detail)) {
+    return {
+      ok: false,
+      reason: "veth_unsupported",
+      networkName,
+      subnet: route.subnet,
+      gatewayIp: route.gatewayIp,
+      routeKind: route.routeKind,
+      detail,
+    };
+  }
+  if (isProbeTimeout(result)) {
+    return {
+      ok: false,
+      reason: "probe_timeout",
+      networkName,
+      subnet: route.subnet,
+      gatewayIp: route.gatewayIp,
+      routeKind: route.routeKind,
+      detail,
+    };
+  }
   if (result.status !== 1 || isNameResolutionFailure(detail)) {
     return {
       ok: false,
@@ -271,6 +349,32 @@ export function formatSandboxBridgeUnreachableMessage(
       "  ⚠ Could not verify sandbox bridge reachability.",
       "    This does not prove the gateway is unreachable; continuing.",
       result.detail ? `    ${result.detail}` : undefined,
+    ].filter((line): line is string => Boolean(line)).join("\n");
+  }
+
+  if (result.reason === "veth_unsupported") {
+    return [
+      "  ✗ Docker could not create the sandbox bridge veth pair.",
+      result.detail ? `    ${result.detail}` : undefined,
+      "    This matches Jetson kernel/Docker bridge environments where veth creation returns `operation not supported`.",
+      "    Update the host kernel/Docker bridge networking support, or run NemoClaw on a host whose Docker bridge networking can create veth interfaces.",
+    ].filter((line): line is string => Boolean(line)).join("\n");
+  }
+
+  if (result.reason === "probe_timeout") {
+    return [
+      "  ✗ Docker-driver sandbox bridge reachability probe timed out.",
+      result.detail ? `    ${result.detail}` : undefined,
+      "    Restart Docker and check for stuck container/network operations before retrying `nemoclaw onboard`.",
+    ].filter((line): line is string => Boolean(line)).join("\n");
+  }
+
+  if (result.reason === "docker_daemon_unreachable") {
+    return [
+      "  ✗ Docker daemon is not reachable for the sandbox bridge probe.",
+      result.detail ? `    ${result.detail}` : undefined,
+      "    Restart the Docker daemon (e.g. `sudo systemctl restart docker`, or restart Docker Desktop/Colima)",
+      "    and re-run `nemoclaw onboard`.",
     ].filter((line): line is string => Boolean(line)).join("\n");
   }
 
